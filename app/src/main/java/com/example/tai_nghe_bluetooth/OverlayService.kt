@@ -28,6 +28,7 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ComposeShader
 import android.graphics.LinearGradient
 import android.graphics.Matrix
 import android.graphics.Paint
@@ -56,39 +57,48 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 
-/**
- * Lớp chứa video, làm phần TRÊN mờ dần (trong suốt) rồi đậm dần xuống dưới.
- * Dùng mặt nạ alpha (DST_IN) nên phần mờ hoà vào nền của card phía sau.
- */
-private class TopFadeLayout(context: Context) : FrameLayout(context) {
-
-    // Tỉ lệ chiều cao (tính từ trên xuống) mà video chuyển từ trong suốt sang rõ hoàn toàn.
-    var fadeFraction = 0.5f
-
+/** Fades the popup content smoothly into the transparent overlay at its outer edges. */
+private class EdgeFadeLayout(context: Context) : FrameLayout(context) {
     private val maskPaint = Paint().apply {
         xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
+    }
+    private var shaderWidth = 0f
+    private var shaderHeight = 0f
+
+    private fun updateMaskShader(w: Float, h: Float) {
+        if (w == shaderWidth && h == shaderHeight) return
+
+        val opaque = Color.WHITE
+        val edge = Color.argb(165, 255, 255, 255)
+        val stops = floatArrayOf(0f, 0.1f, 0.9f, 1f)
+        val horizontal = LinearGradient(
+            0f, 0f, w, 0f,
+            intArrayOf(edge, opaque, opaque, edge),
+            stops,
+            Shader.TileMode.CLAMP
+        )
+        val vertical = LinearGradient(
+            0f, 0f, 0f, h,
+            intArrayOf(edge, opaque, opaque, edge),
+            stops,
+            Shader.TileMode.CLAMP
+        )
+        maskPaint.shader = ComposeShader(horizontal, vertical, PorterDuff.Mode.MULTIPLY)
+        shaderWidth = w
+        shaderHeight = h
     }
 
     override fun dispatchDraw(canvas: Canvas) {
         val w = width.toFloat()
         val h = height.toFloat()
+        if (w <= 0f || h <= 0f) {
+            super.dispatchDraw(canvas)
+            return
+        }
         val saved = canvas.saveLayer(0f, 0f, w, h, null)
-
         super.dispatchDraw(canvas)
-
-        val fadeHeight = (h * fadeFraction).coerceAtLeast(1f)
-        maskPaint.shader = LinearGradient(
-            0f, 0f, 0f, fadeHeight,
-            intArrayOf(
-                Color.argb(0, 0, 0, 0),     // trên cùng: trong suốt
-                Color.argb(90, 0, 0, 0),    // giữa: hơi mờ
-                Color.argb(255, 0, 0, 0)    // dưới: rõ hoàn toàn
-            ),
-            floatArrayOf(0f, 0.5f, 1f),
-            Shader.TileMode.CLAMP
-        )
+        updateMaskShader(w, h)
         canvas.drawRect(0f, 0f, w, h, maskPaint)
-
         canvas.restoreToCount(saved)
     }
 }
@@ -305,7 +315,7 @@ class OverlayService : Service() {
 
         // ---- Kích thước popup (chỉnh ở đây cho tiện) ----
         // Chiều rộng card so với chiều rộng màn hình (trước đây 0.78).
-        private const val CARD_WIDTH_FRACTION = 0.90f
+        private const val CARD_WIDTH_FRACTION = 1f
         // Chiều cao video tăng thêm (tỉ lệ theo chiều cao màn hình) = ~1/2 khoảng trắng.
         private const val EXTRA_VIDEO_HEIGHT_FRACTION = 0.08f
         // Chiều cao video tối đa (tỉ lệ theo chiều cao màn hình).
@@ -982,7 +992,7 @@ class OverlayService : Service() {
             else -> 0.5f
         }
         videoZoom = prefs.getFloat("video_zoom", 1f).coerceIn(1f, 3f)
-        showBattery = prefs.getBoolean("show_battery", true)
+        showBattery = prefs.getBoolean("show_battery", false)
         batteryStatus = if (showBattery) "Đang đọc pin…" else null
 
         val density = resources.displayMetrics.density
@@ -1033,6 +1043,12 @@ class OverlayService : Service() {
             }
             clipToOutline = true
             isClickable = true // bấm trong card thì không đóng
+        }
+        val fadedCard = EdgeFadeLayout(this).apply {
+            addView(
+                card,
+                FrameLayout.LayoutParams(cardW, FrameLayout.LayoutParams.WRAP_CONTENT)
+            )
         }
 
         // Video phủ kín card; tên + nút đóng + pin được vẽ ĐÈ LÊN video.
@@ -1148,13 +1164,13 @@ class OverlayService : Service() {
 
         // Card nằm sát đáy màn hình; phần còn lại là vùng bấm để đóng.
         root.addView(
-            card,
+            fadedCard,
             FrameLayout.LayoutParams(
                 cardW,
                 FrameLayout.LayoutParams.WRAP_CONTENT
             ).apply {
                 gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-                bottomMargin = dp(28)
+                bottomMargin = 0
             }
         )
 
