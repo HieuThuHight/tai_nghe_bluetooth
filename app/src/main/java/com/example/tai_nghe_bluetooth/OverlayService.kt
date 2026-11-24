@@ -15,10 +15,16 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothHeadset
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.le.BluetoothLeScanner
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Canvas
 import android.graphics.Color
@@ -31,6 +37,7 @@ import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 import android.graphics.Shader
 import android.graphics.SurfaceTexture
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
@@ -112,11 +119,13 @@ fun hasUsageAccess(context: Context): Boolean {
 
 /**
  * Hiệu ứng động: hai tai nghe nhấp nhô nhẹ, sóng âm lan toả ra hai bên.
+ * Số pin (Trái / Phải / Hộp sạc) được vẽ ngay trên hiệu ứng này.
  * Tự chạy khi gắn vào cửa sổ và tự dừng khi popup bị gỡ.
  */
 private class EarbudsAnimView(context: Context) : View(context) {
 
     private val d = resources.displayMetrics.density
+    private val sp = resources.displayMetrics.scaledDensity
     private val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
     private val meshPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(70, 0, 0, 0) }
     private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -125,8 +134,49 @@ private class EarbudsAnimView(context: Context) : View(context) {
         strokeWidth = 2.2f * d
         strokeCap = Paint.Cap.ROUND
     }
+    private val pctPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.CENTER
+        textSize = 14f * sp
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        setShadowLayer(4f * d, 0f, 1f * d, Color.BLACK)
+    }
+    private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.CENTER
+        textSize = 10f * sp
+        color = Color.argb(210, 255, 255, 255)
+        setShadowLayer(3f * d, 0f, 1f * d, Color.BLACK)
+    }
     private val rect = RectF()
     private var phase = 0f
+
+    // Dữ liệu pin (-1 = chưa biết).
+    private var showBattery = false
+    private var leftPct = -1
+    private var rightPct = -1
+    private var casePct = -1
+    private var overallPct = -1
+    private var chargeL = false
+    private var chargeR = false
+    private var chargeCase = false
+    private var statusText: String? = null
+
+    fun setBattery(
+        enabled: Boolean,
+        left: Int, right: Int, case: Int, overall: Int,
+        chargingLeft: Boolean, chargingRight: Boolean, chargingCase: Boolean,
+        status: String?
+    ) {
+        showBattery = enabled
+        leftPct = left
+        rightPct = right
+        casePct = case
+        overallPct = overall
+        chargeL = chargingLeft
+        chargeR = chargingRight
+        chargeCase = chargingCase
+        statusText = status
+        invalidate()
+    }
 
     private val animator = ValueAnimator.ofFloat(0f, 1f).apply {
         duration = 2400L
@@ -148,11 +198,43 @@ private class EarbudsAnimView(context: Context) : View(context) {
         super.onDetachedFromWindow()
     }
 
+    private fun levelColor(level: Int): Int = when {
+        level < 0 -> Color.WHITE
+        level >= 40 -> Color.rgb(120, 255, 170)
+        level >= 20 -> Color.rgb(255, 200, 80)
+        else -> Color.rgb(255, 105, 95)
+    }
+
+    private fun drawPct(canvas: Canvas, level: Int, charging: Boolean, x: Float, y: Float, prefix: String = "") {
+        pctPaint.color = levelColor(level)
+        val text = prefix + (if (level >= 0) "$level%" else "--") + (if (charging) " ⚡" else "")
+        canvas.drawText(text, x, y, pctPaint)
+    }
+
+    private fun drawBattery(canvas: Canvas, cx: Float, cy: Float, gap: Float) {
+        val baseY = height - 10f * d
+        if (leftPct >= 0 || rightPct >= 0) {
+            drawPct(canvas, leftPct, chargeL, cx - gap, baseY)
+            drawPct(canvas, rightPct, chargeR, cx + gap, baseY)
+            if (casePct >= 0) {
+                canvas.drawText("Hộp sạc", cx, cy - 3f * d, labelPaint)
+                drawPct(canvas, casePct, chargeCase, cx, cy + 14f * d)
+            }
+        } else if (overallPct >= 0) {
+            drawPct(canvas, overallPct, false, cx, baseY, "Pin ")
+        } else {
+            statusText?.let {
+                pctPaint.color = Color.WHITE
+                canvas.drawText(it, cx, baseY, pctPaint)
+            }
+        }
+    }
+
     override fun onDraw(canvas: Canvas) {
         val cx = width / 2f
         val cy = height / 2f - 4f * d
         val headR = 9f * d
-        val gap = 28f * d
+        val gap = 34f * d
 
         for (side in intArrayOf(-1, 1)) {
             val bx = cx + side * gap
@@ -183,35 +265,8 @@ private class EarbudsAnimView(context: Context) : View(context) {
             canvas.drawCircle(side * 2f * d, -1f * d, 3.5f * d, meshPaint)
             canvas.restore()
         }
-    }
-}
 
-/** Một hàng pin: nhãn + thanh pin + số %. */
-private class BatteryRowUi(
-    val container: LinearLayout,
-    val fillView: View,
-    val fillDrawable: GradientDrawable,
-    val percentView: TextView,
-    val trackWidthPx: Int
-) {
-    fun setLevel(level: Int) {
-        percentView.text = "$level%"
-        val color = when {
-            level >= 40 -> Color.rgb(0, 220, 100)
-            level >= 20 -> Color.rgb(255, 170, 0)
-            else -> Color.rgb(255, 69, 58)
-        }
-        fillDrawable.setColor(color)
-        val params = fillView.layoutParams
-        params.width = trackWidthPx * level / 100
-        fillView.layoutParams = params
-    }
-
-    fun setUnknown(text: String) {
-        percentView.text = text
-        val params = fillView.layoutParams
-        params.width = 0
-        fillView.layoutParams = params
+        if (showBattery) drawBattery(canvas, cx, cy, gap)
     }
 }
 
@@ -223,6 +278,9 @@ class OverlayService : Service() {
             "android.bluetooth.device.action.BATTERY_LEVEL_CHANGED"
         private const val EXTRA_BATTERY_LEVEL =
             "android.bluetooth.device.extra.BATTERY_LEVEL"
+
+        // Action để app yêu cầu hiện thử popup.
+        const val ACTION_PREVIEW = "com.example.tai_nghe_bluetooth.ACTION_PREVIEW"
 
         // Mã công ty Apple (0x004C) - nhiều tai nghe báo pin qua lệnh +IPHONEACCEV.
         private const val COMPANY_ID_APPLE = 76
@@ -238,14 +296,18 @@ class OverlayService : Service() {
         // Thời gian popup hiện dần từ trong suốt sang rõ.
         private const val FADE_IN_DURATION_MS = 450L
 
-        // Hiện thanh pin trên popup hay không (false = ẩn pin, chỉ hiện hiệu ứng tai nghe).
-        private const val SHOW_BATTERY = false
+        // ---- Quét BLE để đọc pin AirPods (Trái / Phải / Hộp sạc) ----
+        // Chỉ nhận gói từ thiết bị ở gần (tránh lấy nhầm AirPods của người khác).
+        private const val BLE_MIN_RSSI = -72
+        // Tự dừng quét sau thời gian này để tiết kiệm pin điện thoại.
+        private const val BLE_SCAN_TIMEOUT_MS = 26_000L
+        private const val BLE_STALE_MS = 4_000L
 
         // ---- Kích thước popup (chỉnh ở đây cho tiện) ----
         // Chiều rộng card so với chiều rộng màn hình (trước đây 0.78).
         private const val CARD_WIDTH_FRACTION = 0.90f
         // Chiều cao video tăng thêm (tỉ lệ theo chiều cao màn hình) = ~1/2 khoảng trắng.
-        private const val EXTRA_VIDEO_HEIGHT_FRACTION = 0.07f
+        private const val EXTRA_VIDEO_HEIGHT_FRACTION = 0.08f
         // Chiều cao video tối đa (tỉ lệ theo chiều cao màn hình).
         private const val MAX_VIDEO_HEIGHT_FRACTION = 0.45f
 
@@ -285,12 +347,28 @@ class OverlayService : Service() {
     private var lastRight = -1
     private var lastCase = -1
 
-    // Các hàng pin trong popup.
-    private var overallRow: BatteryRowUi? = null
-    private var leftRow: BatteryRowUi? = null
-    private var rightRow: BatteryRowUi? = null
-    private var caseRow: BatteryRowUi? = null
+    // Trạng thái sạc (đọc được qua BLE).
+    private var chargeL = false
+    private var chargeR = false
+    private var chargeCase = false
+
+    // View hiệu ứng tai nghe (đồng thời là nơi vẽ số pin).
+    private var earbudsView: EarbudsAnimView? = null
+    private var showBattery = true
+    private var batteryStatus: String? = null
     private var batteryPollCount = 0
+
+    // Quét BLE.
+    private var bleScanner: BluetoothLeScanner? = null
+    private var bleBestRssi = -127
+    private var bleBestAt = 0L
+    private val bleTimeout = Runnable { stopBleScan() }
+
+    // Cài đặt hiển thị video (đặt trong app, đọc lại mỗi lần popup hiện).
+    private var videoRotation = 0      // 0 / 90 / 180 / 270
+    private var videoFit = false       // false = lấp đầy (cắt), true = vừa khung
+    private var videoAnchor = 0.5f     // 0 = trên/trái, 0.5 = giữa, 1 = dưới/phải
+    private var videoZoom = 1f         // 1.0 .. 3.0
 
     private val profileProxies = mutableMapOf<Int, BluetoothProfile>()
 
@@ -392,9 +470,10 @@ class OverlayService : Service() {
 
             if (device != null) {
                 // Thử đọc pin riêng từng bên (trái/phải/hộp sạc).
-                lastLeft = readUntetheredBattery(device, METADATA_LEFT_BATTERY)
-                lastRight = readUntetheredBattery(device, METADATA_RIGHT_BATTERY)
-                lastCase = readUntetheredBattery(device, METADATA_CASE_BATTERY)
+                // (Chỉ ghi khi đọc được, để không xoá số do BLE đã đọc.)
+                readUntetheredBattery(device, METADATA_LEFT_BATTERY).let { if (it >= 0) lastLeft = it }
+                readUntetheredBattery(device, METADATA_RIGHT_BATTERY).let { if (it >= 0) lastRight = it }
+                readUntetheredBattery(device, METADATA_CASE_BATTERY).let { if (it >= 0) lastCase = it }
 
                 // Pin chung (dự phòng khi không có số riêng từng bên).
                 val level = readBatteryLevel(device)
@@ -407,7 +486,10 @@ class OverlayService : Service() {
             batteryPollCount++
             val hasAnyBattery = lastKnownBattery >= 0 || lastLeft >= 0 || lastRight >= 0
             if (!hasAnyBattery && batteryPollCount >= BATTERY_GIVE_UP_AFTER_POLLS) {
-                overallRow?.setUnknown("Không đọc được pin")
+                if (batteryStatus == null || batteryStatus == "Đang đọc pin…") {
+                    batteryStatus = "Không đọc được pin"
+                }
+                refreshBatteryUi()
             }
 
             handler.postDelayed(this, BATTERY_POLL_INTERVAL_MS)
@@ -462,6 +544,11 @@ class OverlayService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Từ nút "Xem thử popup" trong app: dựng lại popup để xem cài đặt mới.
+        if (intent?.action == ACTION_PREVIEW) {
+            hideVideoPopup()
+            showVideoPopup()
+        }
         return START_STICKY
     }
 
@@ -621,6 +708,9 @@ class OverlayService : Service() {
         lastLeft = -1
         lastRight = -1
         lastCase = -1
+        chargeL = false
+        chargeR = false
+        chargeCase = false
     }
 
     // Đọc pin từng phần từ metadata ẩn của thiết bị. Trả về -1 nếu không có.
@@ -644,89 +734,121 @@ class OverlayService : Service() {
         refreshBatteryUi()
     }
 
-    // Nếu có số riêng từng bên thì hiện Trái/Phải(/Hộp); nếu không thì hiện 1 hàng pin chung.
+    // Đẩy số pin hiện có lên popup (vẽ trên hiệu ứng tai nghe).
     private fun refreshBatteryUi() {
-        val overall = overallRow ?: return
-        val left = leftRow ?: return
-        val right = rightRow ?: return
-        val case = caseRow ?: return
+        earbudsView?.setBattery(
+            showBattery,
+            lastLeft, lastRight, lastCase, lastKnownBattery,
+            chargeL, chargeR, chargeCase,
+            batteryStatus
+        )
+    }
 
-        val hasBuds = lastLeft >= 0 || lastRight >= 0
+    // ---------------- Đọc pin AirPods qua BLE ----------------
 
-        overall.container.visibility = if (hasBuds) View.GONE else View.VISIBLE
-        left.container.visibility = if (hasBuds) View.VISIBLE else View.GONE
-        right.container.visibility = if (hasBuds) View.VISIBLE else View.GONE
-        case.container.visibility = if (hasBuds && lastCase >= 0) View.VISIBLE else View.GONE
+    private fun hasBleScanPermission(): Boolean {
+        val perm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            Manifest.permission.BLUETOOTH_SCAN
+        } else {
+            Manifest.permission.ACCESS_FINE_LOCATION
+        }
+        return checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED
+    }
 
-        if (hasBuds) {
-            applyRow(left, lastLeft)
-            applyRow(right, lastRight)
-            applyRow(case, lastCase)
-        } else if (lastKnownBattery >= 0) {
-            overall.setLevel(lastKnownBattery)
+    private val bleCallback = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: ScanResult) {
+            handleBleResult(result)
+        }
+
+        override fun onBatchScanResults(results: MutableList<ScanResult>) {
+            results.forEach { handleBleResult(it) }
         }
     }
 
-    private fun applyRow(row: BatteryRowUi, level: Int) {
-        if (level in 0..100) row.setLevel(level) else row.setUnknown("--")
+    private fun startBleScan() {
+        stopBleScan()
+        if (!showBattery) return
+        if (!hasBleScanPermission()) {
+            batteryStatus = "Chưa cấp quyền đọc pin"
+            refreshBatteryUi()
+            return
+        }
+        try {
+            val manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
+            val scanner = manager.adapter?.bluetoothLeScanner ?: return
+            // Chỉ nhận gói quảng bá của Apple có kiểu 0x07 (AirPods "proximity pairing").
+            val filter = ScanFilter.Builder()
+                .setManufacturerData(COMPANY_ID_APPLE, byteArrayOf(0x07), byteArrayOf(0xFF.toByte()))
+                .build()
+            val settings = ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
+                .build()
+            bleBestRssi = -127
+            bleBestAt = 0L
+            scanner.startScan(listOf(filter), settings, bleCallback)
+            bleScanner = scanner
+            handler.postDelayed(bleTimeout, BLE_SCAN_TIMEOUT_MS)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
     }
 
-    private fun buildBatteryRow(
-        label: String,
-        density: Float,
-        trackDp: Int = 140,
-        labelDp: Int = 44,
-        gapDp: Int = 8,
-        endGapDp: Int = 12,
-        textSp: Float = 15f
-    ): BatteryRowUi {
-        fun dp(value: Int): Int = (value * density).toInt()
-        val trackWidth = dp(trackDp)
+    private fun stopBleScan() {
+        handler.removeCallbacks(bleTimeout)
+        try {
+            bleScanner?.stopScan(bleCallback)
+        } catch (_: Exception) {
+        }
+        bleScanner = null
+    }
 
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL or Gravity.CENTER_HORIZONTAL
+    // Giải mã gói AirPods (định dạng do cộng đồng dò ngược, không phải tài liệu chính thức của Apple):
+    // [0]=0x07 [1]=độ dài [2]=0x01 [3..4]=model [5]=trạng thái [6]=pin 2 tai [7]=cờ sạc | pin hộp
+    private fun handleBleResult(result: ScanResult) {
+        if (popupView == null) return
+        val data = result.scanRecord?.getManufacturerSpecificData(COMPANY_ID_APPLE) ?: return
+        if (data.size < 8 || data[0] != 0x07.toByte()) return
+
+        val now = System.currentTimeMillis()
+        val rssi = result.rssi
+        if (rssi < BLE_MIN_RSSI) return
+        // Đang có thiết bị mạnh hơn nhiều thì bỏ qua thiết bị yếu (AirPods của người khác).
+        if (now - bleBestAt < BLE_STALE_MS && rssi < bleBestRssi - 10) return
+        bleBestRssi = rssi
+        bleBestAt = now
+
+        val status = data[5].toInt() and 0xFF
+        val pods = data[6].toInt() and 0xFF
+        val flags = data[7].toInt() and 0xFF
+
+        // Bit này cho biết hai tai đang bị đảo trái/phải trong gói tin.
+        val flip = ((status shr 4) and 0x02) == 0
+        val hi = (pods shr 4) and 0x0F
+        val lo = pods and 0x0F
+        val leftN = if (flip) hi else lo
+        val rightN = if (flip) lo else hi
+        val caseN = flags and 0x0F
+        val charge = (flags shr 4) and 0x0F
+
+        fun toPct(n: Int): Int = when {
+            n in 0..9 -> n * 10 + 5   // mỗi mức ~10%
+            n == 10 -> 100
+            else -> -1                 // 15 = chưa biết
         }
 
-        val labelView = TextView(this).apply {
-            text = label
-            textSize = textSp
-            setTextColor(Color.LTGRAY)
-        }
+        val l = toPct(leftN)
+        val r = toPct(rightN)
+        val c = toPct(caseN)
+        if (l < 0 && r < 0 && c < 0) return
 
-        val track = FrameLayout(this).apply {
-            background = GradientDrawable().apply {
-                setColor(Color.rgb(70, 70, 70))
-                cornerRadius = dp(6).toFloat()
-            }
-        }
-        val fillDrawable = GradientDrawable().apply {
-            setColor(Color.rgb(0, 220, 100))
-            cornerRadius = dp(6).toFloat()
-        }
-        val fillView = View(this).apply { background = fillDrawable }
-        track.addView(fillView, FrameLayout.LayoutParams(0, FrameLayout.LayoutParams.MATCH_PARENT))
-
-        val percentView = TextView(this).apply {
-            text = "--"
-            textSize = textSp
-            setTextColor(Color.LTGRAY)
-        }
-
-        row.addView(
-            labelView,
-            LinearLayout.LayoutParams(dp(labelDp), LinearLayout.LayoutParams.WRAP_CONTENT)
-        )
-        row.addView(
-            track,
-            LinearLayout.LayoutParams(trackWidth, dp(12)).apply {
-                leftMargin = dp(gapDp)
-                rightMargin = dp(endGapDp)
-            }
-        )
-        row.addView(percentView)
-
-        return BatteryRowUi(row, fillView, fillDrawable, percentView, trackWidth)
+        lastLeft = l
+        lastRight = r
+        lastCase = c
+        chargeL = (charge and (if (flip) 2 else 1)) != 0
+        chargeR = (charge and (if (flip) 1 else 2)) != 0
+        chargeCase = (charge and 4) != 0
+        batteryStatus = null
+        refreshBatteryUi()
     }
 
     // ---------------- Video toàn màn hình ----------------
@@ -754,19 +876,34 @@ class OverlayService : Service() {
         }
     }
 
-    // Phóng video lấp đầy khung, giữ đúng tỉ lệ (center-crop).
+    // Hiển thị video theo cài đặt: xoay, vừa khung / lấp đầy, phóng to, vị trí cắt.
     private fun applyFit(textureView: TextureView) {
         val viewW = textureView.width.toFloat()
         val viewH = textureView.height.toFloat()
         if (viewW == 0f || viewH == 0f || lastVideoW == 0 || lastVideoH == 0) return
 
-        // maxOf = lấp đầy khung (cắt nhẹ phần thừa ở hai bên), không để dải đen.
-        val scale = maxOf(viewW / lastVideoW, viewH / lastVideoH)
-        val scaleX = lastVideoW * scale / viewW
-        val scaleY = lastVideoH * scale / viewH
+        val cx = viewW / 2f
+        val cy = viewH / 2f
+
+        // Kích thước video sau khi xoay thủ công.
+        val swapped = videoRotation == 90 || videoRotation == 270
+        val ew = if (swapped) lastVideoH.toFloat() else lastVideoW.toFloat()
+        val eh = if (swapped) lastVideoW.toFloat() else lastVideoH.toFloat()
+
+        val base = if (videoFit) minOf(viewW / ew, viewH / eh) else maxOf(viewW / ew, viewH / eh)
+        val scale = base * videoZoom
 
         val matrix = Matrix()
-        matrix.setScale(scaleX, scaleY, viewW / 2f, viewH / 2f)
+        // 1) TextureView mặc định kéo giãn video cho vừa khung -> trả về đúng tỉ lệ gốc.
+        matrix.setScale(lastVideoW / viewW, lastVideoH / viewH, cx, cy)
+        // 2) Xoay.
+        matrix.postRotate(videoRotation.toFloat(), cx, cy)
+        // 3) Phóng (vừa khung / lấp đầy) nhân với mức zoom.
+        matrix.postScale(scale, scale, cx, cy)
+        // 4) Dịch để giữ phần trên/giữa/dưới khi video lớn hơn khung.
+        val overflowX = maxOf(0f, ew * scale - viewW)
+        val overflowY = maxOf(0f, eh * scale - viewH)
+        matrix.postTranslate((0.5f - videoAnchor) * overflowX, (0.5f - videoAnchor) * overflowY)
         textureView.setTransform(matrix)
     }
 
@@ -837,6 +974,16 @@ class OverlayService : Service() {
         val videoUri = prefs.getString("video_uri", null) ?: return
 
         isMuted = prefs.getBoolean("muted", false)
+        videoRotation = (prefs.getInt("video_rotation", 0) % 360 + 360) % 360
+        videoFit = prefs.getBoolean("video_fit", false)
+        videoAnchor = when (prefs.getInt("video_anchor", 1)) {
+            0 -> 0f
+            2 -> 1f
+            else -> 0.5f
+        }
+        videoZoom = prefs.getFloat("video_zoom", 1f).coerceIn(1f, 3f)
+        showBattery = prefs.getBoolean("show_battery", true)
+        batteryStatus = if (showBattery) "Đang đọc pin…" else null
 
         val density = resources.displayMetrics.density
         fun dp(value: Int): Int = (value * density).toInt()
@@ -851,7 +998,9 @@ class OverlayService : Service() {
         // Kích thước popup theo tỉ lệ video để hiển thị ĐỦ video, không bị cắt.
         val screenW = resources.displayMetrics.widthPixels
         val screenH = resources.displayMetrics.heightPixels
-        val aspect = readVideoAspect(Uri.parse(videoUri))
+        var aspect = readVideoAspect(Uri.parse(videoUri))
+        // Xoay 90°/270° thì tỉ lệ khung đảo lại.
+        if (videoRotation == 90 || videoRotation == 270) aspect = 1f / aspect
 
         var cardW = (screenW * CARD_WIDTH_FRACTION).toInt()
         var videoH = (cardW / aspect).toInt()
@@ -860,11 +1009,13 @@ class OverlayService : Service() {
             // Video dọc/cao: thu nhỏ khung lại cho vừa chiều cao tối đa.
             cardW = (maxVideoH * aspect).toInt().coerceAtLeast(dp(220))
             videoH = (cardW / aspect).toInt()
-        } else {
-            // Video ngang: kéo cao thêm ~1/2 khoảng trắng phía trên.
+        } else if (!videoFit) {
+            // Video ngang (chế độ lấp đầy): kéo cao thêm ~1/2 khoảng trắng phía trên.
             val extra = (screenH * EXTRA_VIDEO_HEIGHT_FRACTION).toInt()
             videoH = (videoH + extra).coerceAtMost(maxVideoH)
         }
+        // Đủ cao để chứa tên + hiệu ứng tai nghe + số pin.
+        videoH = maxOf(videoH, dp(200))
 
         // Khung popup (card): tiêu đề trên cùng, video ở giữa, pin ở dưới.
         val cardRadius = dp(32).toFloat()
@@ -929,7 +1080,7 @@ class OverlayService : Service() {
         }
         videoFrame.addView(
             bottomScrim,
-            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, dp(120)).apply {
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, dp(130)).apply {
                 gravity = Gravity.BOTTOM
             }
         )
@@ -980,60 +1131,16 @@ class OverlayService : Service() {
             }
         )
 
-        // Pin đè lên phía dưới video: Trái | Phải cạnh nhau (hộp sạc bên dưới nếu có).
-        // Nếu không đọc được pin từng bên thì hiện 1 hàng pin chung.
-        val overall = buildBatteryRow("Pin", density)
-        overall.setUnknown("Đang đọc pin…")
-        val left = buildBatteryRow("Trái", density, 56, 34, 6, 6, 14f)
-        val right = buildBatteryRow("Phải", density, 56, 34, 6, 6, 14f)
-        val caseUi = buildBatteryRow("Hộp", density)
-        for (r in listOf(left, right, caseUi)) r.container.visibility = View.GONE
-
-        val budsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
-        budsRow.addView(left.container, LinearLayout.LayoutParams(0, dp(34), 1f))
-        budsRow.addView(right.container, LinearLayout.LayoutParams(0, dp(34), 1f))
-
-        val batteryBox = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-        }
-        batteryBox.addView(
-            overall.container,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(34))
-        )
-        batteryBox.addView(
-            budsRow,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            )
-        )
-        batteryBox.addView(
-            caseUi.container,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(34))
-        )
-        batteryBox.visibility = if (SHOW_BATTERY) View.VISIBLE else View.GONE
-        videoFrame.addView(
-            batteryBox,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                gravity = Gravity.BOTTOM
-                bottomMargin = dp(12)
-            }
-        )
-
-        // Hiệu ứng động hai tai nghe + sóng âm (đè lên phía dưới video).
+        // Hiệu ứng động hai tai nghe + sóng âm; số pin vẽ ngay trên hiệu ứng này.
         val earbudsAnim = EarbudsAnimView(this)
+        earbudsAnim.setBattery(
+            showBattery, -1, -1, -1, -1, false, false, false, batteryStatus
+        )
         videoFrame.addView(
             earbudsAnim,
-            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, dp(76)).apply {
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, dp(88)).apply {
                 gravity = Gravity.BOTTOM
-                bottomMargin = dp(6)
+                bottomMargin = dp(4)
             }
         )
 
@@ -1072,10 +1179,7 @@ class OverlayService : Service() {
         try {
             windowManager.addView(root, windowParams)
             popupView = root
-            overallRow = overall
-            leftRow = left
-            rightRow = right
-            caseRow = caseUi
+            earbudsView = earbudsAnim
 
             // Hiện dần từ trong suốt sang rõ.
             root.animate().alpha(1f).setDuration(FADE_IN_DURATION_MS).start()
@@ -1085,6 +1189,9 @@ class OverlayService : Service() {
             batteryPollCount = 0
             handler.removeCallbacks(batteryPoller)
             handler.post(batteryPoller)
+
+            // Quét BLE để lấy pin riêng từng bên của AirPods (chỉ trong lúc popup hiện).
+            startBleScan()
 
             // Tự ẩn popup khi người dùng mở app khác (cần quyền "Truy cập dữ liệu sử dụng").
             handler.removeCallbacks(foregroundWatcher)
@@ -1097,10 +1204,7 @@ class OverlayService : Service() {
             }
         } catch (e: Exception) {
             popupView = null
-            overallRow = null
-            leftRow = null
-            rightRow = null
-            caseRow = null
+            earbudsView = null
             e.printStackTrace()
         }
     }
@@ -1108,12 +1212,10 @@ class OverlayService : Service() {
     private fun hideVideoPopup() {
         handler.removeCallbacks(batteryPoller)
         handler.removeCallbacks(foregroundWatcher)
+        stopBleScan()
 
         releasePlayer()
-        overallRow = null
-        leftRow = null
-        rightRow = null
-        caseRow = null
+        earbudsView = null
 
         popupView?.let { view ->
             try {
